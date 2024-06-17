@@ -13,7 +13,7 @@
 # limitations under the License.
 
 """
-BB8 is a daemon the re-balance data between RSEs.
+BB8 is a daemon that re-balances data between RSEs.
 """
 
 import functools
@@ -22,11 +22,11 @@ import socket
 import threading
 from typing import TYPE_CHECKING
 
-from rucio.common.config import config_get_float
+from rucio.common.config import config_get_float, config_get
 from rucio.common.exception import InvalidRSEExpression
 from rucio.common.logging import setup_logging
 from rucio.core.heartbeat import list_payload_counts, sanity_check
-from rucio.core.rse import get_rse_usage
+from rucio.core.rse import get_rse_usage, get_rse_limits
 from rucio.core.rse_expression_parser import parse_expression
 from rucio.daemons.bb8.common import get_active_locks, rebalance_rse
 from rucio.daemons.common import run_daemon
@@ -96,9 +96,11 @@ def run_once(
         "bb8", "max_rse_rebalance_volume", default=500 * 1e9
     )
     min_total = config_get_float("bb8", "min_total", default=20 * 1e9)
+    total_source = config_get("bb8", "total_source", default="total")
     payload_cnt = list_payload_counts(
         executable=DAEMON_NAME, older_than=600, hash_executable=None, session=None
     )
+
     if rse_expression in payload_cnt:
         logger(
             logging.WARNING,
@@ -134,13 +136,12 @@ def run_once(
         total_primary = 0
         total_secondary = 0
         total_total = 0
-        global_ratio = float(0)
+        global_ratio = 0
         for rse in rses:
             logger(logging.DEBUG, "Getting RSE usage on %s", rse["rse"])
             rse_usage = get_rse_usage(rse_id=rse["id"])
             usage_dict = {}
             for item in rse_usage:
-                # TODO Check last update
                 usage_dict[item["source"]] = {
                     "used": item["used"],
                     "free": item["free"],
@@ -153,10 +154,10 @@ def run_once(
                 )
                 rse["secondary"] = usage_dict["expired"]["used"]
                 rse["total"] = (
-                    usage_dict["storage"]["total"]
-                    - usage_dict["min_free_space"]["used"]
+                    usage_dict[total_source]["total"]
+                    - get_rse_limits(rse_id=rse["id"])["MinFreeSpace"]
                 )
-                rse["ratio"] = float(rse["primary"]) / float(rse["total"])
+                rse["ratio"] = rse["primary"] / rse["total"]
             except KeyError as err:
                 logger(
                     logging.ERROR,
@@ -167,9 +168,9 @@ def run_once(
                 break
             total_primary += rse["primary"]
             total_secondary += rse["secondary"]
-            total_total += float(rse["total"])
+            total_total += rse["total"]
             rse["receive_volume"] = 0  # Already rebalanced volume in this run
-            global_ratio = float(total_primary) / float(total_total)
+            global_ratio = total_primary / total_total
             logger(logging.INFO, "Global ratio: %f" % (global_ratio))
 
         for rse in sorted(rses, key=lambda k: k["ratio"]):
@@ -282,7 +283,7 @@ def run_once(
 
                     logger(
                         logging.INFO,
-                        "Rebalance %d TB from %s(%f) to %s(%f)%s",
+                        "Rebalance %.3f TB from %s(%f) to %s(%f)%s",
                         available_target_rebalance_volume / 1e12,
                         source_rse["rse"],
                         source_rse["ratio"],
@@ -353,3 +354,4 @@ def run(
     # Interruptible joins require a timeout.
     while threads[0].is_alive():
         [thread.join(timeout=3.14) for thread in threads]
+
